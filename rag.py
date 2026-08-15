@@ -1,6 +1,8 @@
+import streamlit as st
 from uuid import uuid4
 from dotenv import load_dotenv
 from pathlib import Path
+from urllib.parse import urlparse
 import os
 import time
 
@@ -41,6 +43,38 @@ vector_store = None
 
 
 # ============================================================
+# URL CLEANER
+# ============================================================
+
+def clean_url(url):
+
+    if not url:
+        raise ValueError("URL cannot be empty.")
+
+    url = url.strip()
+
+    # Remove accidental Markdown URL formatting
+    if url.startswith("[") and "](" in url and url.endswith(")"):
+        url = url.split("](", 1)[1][:-1]
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"Invalid URL:\n{url}\n\n"
+            "Please enter a complete URL beginning with "
+            "http:// or https://"
+        )
+
+    if not parsed.netloc:
+        raise ValueError(
+            f"Invalid URL:\n{url}"
+        )
+
+    return url
+
+
+# ============================================================
 # INITIALIZE COMPONENTS
 # ============================================================
 
@@ -57,19 +91,29 @@ def initialize_components():
         mistral_api_key = os.getenv("MISTRAL_API_KEY")
 
         if not mistral_api_key:
+            try: 
+                mistral_api_key = st.secrets["MISTRAL_API_KEY"]
+            except Exception:
+                mistral_api_key = None
+
+        if not mistral_api_key:
+
+
             raise ValueError(
-                "MISTRAL_API_KEY not found. "
-                "Please add it to your .env file."
+                "MISTRAL_API_KEY is not configured. "
+                "Add it to your .env file locally"
+                "or Streamlit Cloud Secrets."
             )
 
         print("Initializing Mistral...")
+        
 
         llm = ChatMistralAI(
             model="mistral-small-latest",
             temperature=0.2,
             max_tokens=300,
             api_key=mistral_api_key,
-            max_retries=5
+            max_retries=2
         )
 
     # --------------------------------------------------------
@@ -102,21 +146,67 @@ def initialize_components():
 
 def process_urls(urls):
 
+    if not urls:
+
+        raise ValueError(
+            "Please provide at least one URL."
+        )
+
+    # --------------------------------------------------------
+    # Clean and validate URLs
+    # --------------------------------------------------------
+
+    cleaned_urls = []
+
+    for url in urls:
+
+        cleaned_urls.append(
+            clean_url(url)
+        )
+
+    print("URLs to process:")
+
+    for url in cleaned_urls:
+        print(url)
+
+    # --------------------------------------------------------
+    # Initialize components
+    # --------------------------------------------------------
+
     print("Initializing components...")
 
     initialize_components()
 
+    # --------------------------------------------------------
+    # Load webpages
+    # --------------------------------------------------------
+
     print("Loading data...")
 
-    loader = UnstructuredURLLoader(
-        urls=urls
-    )
+    try:
 
-    data = loader.load()
+        loader = UnstructuredURLLoader(
+            urls=cleaned_urls
+        )
+
+        data = loader.load()
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"Could not load the provided URLs.\n\n"
+            f"Error: {str(e)}"
+        )
 
     if not data:
-        print("No data was loaded from the URLs.")
-        return
+
+        raise RuntimeError(
+            "No content could be extracted from the provided URLs."
+        )
+
+    # --------------------------------------------------------
+    # Split documents
+    # --------------------------------------------------------
 
     print("Splitting text into chunks...")
 
@@ -130,8 +220,14 @@ def process_urls(urls):
     print(f"Created {len(docs)} chunks.")
 
     if not docs:
-        print("No documents were created.")
-        return
+
+        raise RuntimeError(
+            "No document chunks were created."
+        )
+
+    # --------------------------------------------------------
+    # Add to vector database
+    # --------------------------------------------------------
 
     print("Adding documents to vector database...")
 
@@ -147,6 +243,8 @@ def process_urls(urls):
 
     print("Documents added successfully!")
 
+    return len(docs)
+
 
 # ============================================================
 # GENERATE ANSWER
@@ -154,24 +252,40 @@ def process_urls(urls):
 
 def generate_answer(query):
 
+    if not query or not query.strip():
+
+        return (
+            "Please enter a question.",
+            ""
+        )
+
     initialize_components()
 
     print("\nSearching relevant documents...")
 
+    # --------------------------------------------------------
     # Retrieve relevant documents
+    # --------------------------------------------------------
+
     documents = vector_store.similarity_search(
         query,
         k=2
     )
 
     if not documents:
-        return "I couldn't find relevant information.", ""
+
+        return (
+            "I couldn't find relevant information "
+            "in the processed documents.",
+            ""
+        )
 
     # --------------------------------------------------------
     # Prepare context
     # --------------------------------------------------------
 
     context_parts = []
+
     sources = []
 
     for doc in documents:
@@ -186,6 +300,7 @@ def generate_answer(query):
         )
 
         if source not in sources:
+
             sources.append(source)
 
     context = "\n\n--- DOCUMENT ---\n\n".join(
@@ -197,17 +312,22 @@ def generate_answer(query):
     # --------------------------------------------------------
 
     prompt = f"""
-You are a helpful AI assistant for a news and
-real estate information system.
+You are an AI research assistant.
 
-Answer the user's question using ONLY the information
-provided in the context below.
+Answer the user's question using ONLY the
+information provided in the context.
 
-If the answer cannot be found in the context,
-say that the information is not available in the
-provided documents.
+Do not use outside knowledge.
 
-Do not make up information.
+Do not make up facts.
+
+If the answer is not available in the context,
+clearly say:
+
+"The information is not available in the
+provided sources."
+
+Keep the answer clear, concise and factual.
 
 CONTEXT:
 {context}
@@ -215,11 +335,11 @@ CONTEXT:
 USER QUESTION:
 {query}
 
-Give a clear and concise answer.
+ANSWER:
 """
 
     # --------------------------------------------------------
-    # Call Mistral with retry
+    # Call Mistral
     # --------------------------------------------------------
 
     print("Asking Mistral...")
@@ -234,21 +354,34 @@ Give a clear and concise answer.
 
             answer = response.content
 
-            return answer, "\n".join(sources)
+            # ------------------------------------------------
+            # Handle unexpected empty response
+            # ------------------------------------------------
+
+            if not answer:
+
+                raise RuntimeError(
+                    "Mistral returned an empty response."
+                )
+
+            return (
+                answer,
+                "\n".join(sources)
+            )
 
         except Exception as e:
 
             error_message = str(e)
 
             print(
-                f"\nMistral request failed "
+                f"Mistral request failed "
                 f"(attempt {attempt}/{max_attempts})"
             )
 
             print(error_message)
 
             # ------------------------------------------------
-            # Retry 503 errors
+            # 503 - Service unavailable
             # ------------------------------------------------
 
             if "503" in error_message:
@@ -258,10 +391,7 @@ Give a clear and concise answer.
                     wait_time = attempt * 5
 
                     print(
-                        "Mistral is temporarily unavailable."
-                    )
-
-                    print(
+                        f"Mistral unavailable. "
                         f"Retrying in {wait_time} seconds..."
                     )
 
@@ -270,7 +400,7 @@ Give a clear and concise answer.
                     continue
 
             # ------------------------------------------------
-            # Retry 429 errors
+            # 429 - Rate limit
             # ------------------------------------------------
 
             if "429" in error_message:
@@ -280,10 +410,7 @@ Give a clear and concise answer.
                     wait_time = attempt * 10
 
                     print(
-                        "Mistral rate limit reached."
-                    )
-
-                    print(
+                        f"Rate limit reached. "
                         f"Retrying in {wait_time} seconds..."
                     )
 
@@ -292,21 +419,35 @@ Give a clear and concise answer.
                     continue
 
             # ------------------------------------------------
+            # API key error
+            # ------------------------------------------------
+
+            if (
+                "401" in error_message
+                or "Unauthorized" in error_message
+                or "authentication" in error_message.lower()
+            ):
+
+                raise RuntimeError(
+                    "Mistral authentication failed. "
+                    "Check your MISTRAL_API_KEY."
+                )
+
+            # ------------------------------------------------
             # Other errors
             # ------------------------------------------------
 
-            raise
+            raise RuntimeError(
+                f"Mistral could not generate an answer.\n\n"
+                f"{error_message}"
+            )
 
 
 # ============================================================
-# MAIN
+# TEST MODE
 # ============================================================
 
 if __name__ == "__main__":
-
-    # ========================================================
-    # THE HINDU URLS
-    # ========================================================
 
     urls = [
 
@@ -316,23 +457,11 @@ if __name__ == "__main__":
 
     ]
 
-    # --------------------------------------------------------
-    # Step 1: Load URLs and create vector database
-    # --------------------------------------------------------
-
     process_urls(urls)
 
-    # --------------------------------------------------------
-    # Step 2: Ask question
-    # --------------------------------------------------------
-
     answer, sources = generate_answer(
-        "What is the flyover name that connects   G Block of the Bandra-Kurla Complex?"
+        "What is the flyover name that connects G Block of the Bandra-Kurla Complex?"
     )
-
-    # --------------------------------------------------------
-    # Step 3: Print answer
-    # --------------------------------------------------------
 
     print("\n" + "=" * 60)
     print("ANSWER")
@@ -344,4 +473,4 @@ if __name__ == "__main__":
     print("SOURCES")
     print("=" * 60)
 
-    print(sources)
+    print(sources) 
