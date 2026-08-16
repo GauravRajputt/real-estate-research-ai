@@ -128,6 +128,3 @@ real-estate-tool/
 
 🔗 [GitHub](https://github.com/GauravRajput)
 
----
-
-⭐ **If you like this project, consider giving it a star!**
